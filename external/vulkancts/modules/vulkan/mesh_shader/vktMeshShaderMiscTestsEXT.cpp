@@ -25,6 +25,7 @@
 #include "vktMeshShaderMiscTests.hpp"
 #include "vktMeshShaderUtil.hpp"
 #include "vktTestCase.hpp"
+#include "vktTestCaseUtil.hpp"
 
 #include "vkBuilderUtil.hpp"
 #include "vkImageWithMemory.hpp"
@@ -5972,6 +5973,178 @@ tcu::TestStatus EmitInControlFlowInstance::iterate(void)
     return tcu::TestStatus::pass("Pass");
 }
 
+enum class PartialPayloadWrite {
+    SINGLE = 0,
+    MULTIPLE = 1,
+    FULL = 2,
+};
+
+struct PartialPayloadParams
+{
+    PipelineConstructionType constructionType;
+    PartialPayloadWrite writeType;
+};
+
+void partialPayloadCheckSupport(Context &context, PartialPayloadParams params)
+{
+    checkTaskMeshShaderSupportEXT(context, true, true);
+
+    const auto ctx = context.getContextCommonData();
+    checkPipelineConstructionRequirements(ctx.vki, ctx.physicalDevice, params.constructionType);
+}
+
+void partialPayloadInitPrograms(vk::SourceCollections &dst, PartialPayloadParams params)
+{
+    const auto buildOptions = getMinMeshEXTBuildOptions(dst.usedVulkanVersion);
+
+    const std::string payloadDecl =
+        "struct Payload {\n"
+        "    uint bins[8];\n"
+        "};\n"
+        "taskPayloadSharedEXT Payload payload;\n"
+        ;
+
+    std::ostringstream task;
+    task
+        << "#version 460 core\n"
+        << "#extension GL_EXT_mesh_shader : require\n"
+        << "layout(local_size_x=1, local_size_y=1, local_size_z=1) in;\n"
+        << "\n"
+        << payloadDecl
+        << "\n"
+        << "void main() {\n"
+        << "    payload.bins[7] = 123456;\n"
+        ;
+
+    if (params.writeType != PartialPayloadWrite::SINGLE)
+    {
+        task
+            << "    payload.bins[6] = 0;\n"
+            << "    payload.bins[5] = 0;\n"
+            << "    payload.bins[4] = 0;\n"
+            ;
+
+        if (params.writeType == PartialPayloadWrite::FULL)
+        {
+            task
+                << "    payload.bins[3] = 0;\n"
+                << "    payload.bins[2] = 0;\n"
+                << "    payload.bins[1] = 0;\n"
+                << "    payload.bins[0] = 0;\n"
+                ;
+        }
+    }
+
+    task
+        << "    EmitMeshTasksEXT(1, 1, 1);\n"
+        << "}\n"
+        ;
+    dst.glslSources.add("task") << glu::TaskSource(task.str()) << buildOptions;
+
+    std::ostringstream mesh;
+    mesh
+        << "#version 460 core\n"
+        << "#extension GL_EXT_mesh_shader : require\n"
+        << "layout(local_size_x=32, local_size_y=1, local_size_z=1) in;\n"
+        << "layout(triangles, max_vertices=(32*4), max_primitives=(32*2)) out;\n"
+        << "\n"
+        << payloadDecl
+        << "\n"
+        << "layout (set=0, binding=0, std430) buffer CounterBlock { uint counter; } ssbo;\n"
+        << "\n"
+        << "void main() {\n"
+        << "    if (payload.bins[7] != 123456) {\n"
+        << "        atomicAdd(ssbo.counter, 1u);\n"
+        << "    }\n"
+        << "    SetMeshOutputsEXT(0,0);\n"
+        << "    return;\n"
+        << "}\n"
+        ;
+    dst.glslSources.add("mesh") << glu::MeshSource(mesh.str()) << buildOptions;
+}
+
+tcu::TestStatus partialPayloadRun(Context &context, PartialPayloadParams params)
+{
+    const auto ctx = context.getContextCommonData();
+    const auto descType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    const tcu::IVec3 extent(1, 1, 1);
+    const auto extentU = extent.asUint();
+
+    const auto counterBufferSize = DE_SIZEOF32(uint32_t);
+    const auto counterBufferUsage = (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto counterBufferInfo = makeBufferCreateInfo(counterBufferSize, counterBufferUsage);
+    BufferWithMemory counterBuffer(ctx.vkd, ctx.device, ctx.allocator, counterBufferInfo, HostIntent::RW);
+    {
+        auto &alloc = counterBuffer.getAllocation();
+        memset(alloc.getHostPtr(), 0, counterBufferSize);
+        flushAlloc(ctx.vkd, ctx.device, alloc);
+    }
+
+    DescriptorSetLayoutBuilder setLayoutBuilder;
+    setLayoutBuilder.addSingleBinding(descType, VK_SHADER_STAGE_MESH_BIT_EXT);
+    const auto setLayout = setLayoutBuilder.build(ctx.vkd, ctx.device);
+
+    DescriptorPoolBuilder poolBuilder;
+    poolBuilder.addType(descType);
+    const auto descPool = poolBuilder.build(ctx.vkd, ctx.device, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, 1u);
+    const auto descSet = makeDescriptorSet(ctx.vkd, ctx.device, *descPool, *setLayout);
+
+    DescriptorSetUpdateBuilder updateBuilder;
+    const auto descBufferInfo = makeDescriptorBufferInfo(*counterBuffer, 0ull, VK_WHOLE_SIZE);
+    updateBuilder.writeSingle(*descSet, DescriptorSetUpdateBuilder::Location::binding(0u), descType, &descBufferInfo);
+    updateBuilder.update(ctx.vkd, ctx.device);
+
+    const auto &binaries = context.getBinaryCollection();
+    ShaderWrapper taskShader(ctx.vkd, ctx.device, binaries.get("task"));
+    ShaderWrapper meshShader(ctx.vkd, ctx.device, binaries.get("mesh"));
+
+    PipelineLayoutWrapper pipelineLayout(params.constructionType, ctx.vkd, ctx.device, *setLayout);
+
+    const std::vector<VkViewport> viewports(1u, makeViewport(extent));
+    const std::vector<VkRect2D> scissors(1u, makeRect2D(extent));
+
+    // Empty render pass.
+    RenderPassWrapper renderPass(params.constructionType, ctx.vkd, ctx.device);
+    renderPass.createFramebuffer(ctx.vkd, ctx.device, 0u, nullptr, nullptr, extentU.x(), extentU.y());
+
+    const VkPipelineColorBlendStateCreateInfo colorBlendStateCreateInfo = initVulkanStructure();
+
+    GraphicsPipelineWrapper pipeline(ctx.vki, ctx.vkd, ctx.physicalDevice, ctx.device, context.getDeviceExtensions(), params.constructionType);
+    pipeline
+        .setDefaultRasterizationState()
+        .setDefaultDepthStencilState()
+        .setDefaultMultisampleState()
+        .setupPreRasterizationMeshShaderState(viewports, scissors, pipelineLayout, *renderPass, 0u, taskShader, meshShader)
+        .setupFragmentShaderState(pipelineLayout, *renderPass, 0u, ShaderWrapper())
+        .setupFragmentOutputState(*renderPass, 0u, &colorBlendStateCreateInfo)
+        .buildPipeline();
+
+    CommandPoolWithBuffer cmd(ctx.vkd, ctx.device, ctx.qfIndex);
+    const auto cmdBuffer = *cmd.cmdBuffer;
+
+    beginCommandBuffer(ctx.vkd, cmdBuffer);
+    renderPass.begin(ctx.vkd, cmdBuffer, scissors.at(0u));
+    pipeline.bind(cmdBuffer);
+    ctx.vkd.cmdBindDescriptorSets(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, *pipelineLayout, 0u, 1u, &descSet.get(), 0u, nullptr);
+    ctx.vkd.cmdDrawMeshTasksEXT(cmdBuffer, 1u, 1u, 1u);
+    renderPass.end(ctx.vkd, cmdBuffer);
+    {
+        const auto barrier = makeMemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        cmdPipelineMemoryBarrier(ctx.vkd, cmdBuffer, VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT, VK_PIPELINE_STAGE_HOST_BIT, &barrier);
+    }
+    endCommandBuffer(ctx.vkd, cmdBuffer);
+    submitCommandsAndWait(ctx.vkd, ctx.device, ctx.queue, cmdBuffer);
+
+    invalidateAlloc(ctx.vkd, ctx.device, counterBuffer.getAllocation());
+    uint32_t result = 0u;
+    memcpy(&result, counterBuffer.getAllocation().getHostPtr(), sizeof(result));
+
+    if (result != 0u)
+        TCU_FAIL("Nonzero counter in output buffer");
+
+    return tcu::TestStatus::pass("Pass");
+}
+
 } // anonymous namespace
 
 tcu::TestCaseGroup *createMeshShaderMiscTestsEXT(tcu::TestContext &testCtx)
@@ -6451,6 +6624,35 @@ tcu::TestCaseGroup *createMeshShaderMiscTestsEXT(tcu::TestContext &testCtx)
         const EmitInControlFlowParams params{badEmitLast};
         miscTests->addChild(new EmitInControlFlowCase(testCtx, testName, params));
     }
+
+    const struct {
+        PipelineConstructionType constructionType;
+        const char *name;
+    } constructionTypes[] = {
+        { PIPELINE_CONSTRUCTION_TYPE_MONOLITHIC, "monolithic" },
+        { PIPELINE_CONSTRUCTION_TYPE_FAST_LINKED_LIBRARY, "fast_lib" },
+        { PIPELINE_CONSTRUCTION_TYPE_SHADER_OBJECT_UNLINKED_SPIRV, "shader_objects" },
+    };
+
+    const struct {
+        PartialPayloadWrite writeType;
+        const char *name;
+    } writeTypes[] = {
+        { PartialPayloadWrite::SINGLE, "single_write" },
+        { PartialPayloadWrite::MULTIPLE, "multiple_writes" },
+        { PartialPayloadWrite::FULL, "full_write" },
+    };
+
+    for (const auto &constructionTypeCase : constructionTypes)
+        for (const auto &writeTypeCase : writeTypes)
+        {
+            const PartialPayloadParams params {
+                constructionTypeCase.constructionType,
+                writeTypeCase.writeType,
+            };
+            const auto testName = std::string("partial_payload_") + constructionTypeCase.name + "_" + writeTypeCase.name;
+            addFunctionCaseWithPrograms(miscTests.get(), testName, partialPayloadCheckSupport, partialPayloadInitPrograms, partialPayloadRun, params);
+        }
 
     return miscTests.release();
 }
