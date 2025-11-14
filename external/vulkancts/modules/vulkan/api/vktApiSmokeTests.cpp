@@ -48,6 +48,8 @@
 
 #include "deUniquePtr.hpp"
 
+#include <iostream>
+
 namespace vkt
 {
 namespace api
@@ -851,6 +853,64 @@ tcu::TestStatus renderTriangleUnusedResolveAttachmentTest(Context &context)
     return tcu::TestStatus::pass("Rendering succeeded");
 }
 
+class FindContextInstance : public vkt::TestInstance
+{
+public:
+    FindContextInstance(Context &context) :  vkt::TestInstance(context)
+    {
+    }
+    virtual ~FindContextInstance(void) = default;
+
+    tcu::TestStatus iterate(void)
+    {
+        return tcu::TestStatus::pass("Pass");
+    }
+};
+
+class FindContextCase : public vkt::TestCase
+{
+public:
+    FindContextCase(tcu::TestContext &testCtx, const std::string &name) : vkt::TestCase(testCtx, name)
+    {
+    }
+    virtual ~FindContextCase(void) = default;
+
+    // Override this function if the test requires a custom device. The framework
+    // invokes this function to determine whether one of the recently created
+    // devices can be reused or if a new custom device needs to be created with
+    // the capabilities defined in initDeviceCapabilities.
+    std::string getRequiredCapabilitiesId() const override
+    {
+        return typeid(FindContextCase).name();
+    }
+
+    // Override this function if test requires new custom device.
+    // Requirements for the new device should be recorded to DevCaps.
+    void initDeviceCapabilities(DevCaps &caps) override
+    {
+        caps.addExtension("VK_KHR_swapchain");
+        caps.addFeature(&VkPhysicalDeviceFeatures::robustBufferAccess);
+    }
+
+    void initPrograms(vk::SourceCollections &) const override
+    {
+    }
+    TestInstance *createInstance(Context &context) const override
+    {
+        return new FindContextInstance(context);
+    }
+    void checkSupport(Context &context) const override
+    {
+        std::cout << "[FIND_CONTEXT] Default context ? " << context.isDefaultContext() << "\n";
+        std::cout << "[FIND_CONTEXT] context.getDeviceFeatures().robustBufferAccess=" << context.getDeviceFeatures().robustBufferAccess << "\n";
+
+        const auto ctx = context.getContextCommonData();
+        VkPhysicalDeviceFeatures features;
+        ctx.vki.getPhysicalDeviceFeatures(ctx.physicalDevice, &features);
+        std::cout << "[FIND_CONTEXT] vkGetPhysicalDeviceFeatures.robustBufferAccess=" << features.robustBufferAccess << "\n";
+    }
+};
+
 } // namespace
 
 tcu::TestCaseGroup *createSmokeTests(tcu::TestContext &testCtx)
@@ -864,6 +924,9 @@ tcu::TestCaseGroup *createSmokeTests(tcu::TestContext &testCtx)
     addFunctionCaseWithPrograms(smokeTests.get(), "asm_triangle_no_opname", createProgsNoOpName, renderTriangleTest);
     addFunctionCaseWithPrograms(smokeTests.get(), "unused_resolve_attachment", createTriangleProgs,
                                 renderTriangleUnusedResolveAttachmentTest);
+
+    for (int i = 0; i < 2; ++i)
+        smokeTests->addChild(new FindContextCase(testCtx, "find_context" + std::to_string(i)));
 
     return smokeTests.release();
 }
